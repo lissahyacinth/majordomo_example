@@ -1,21 +1,19 @@
-use crate::commands::Command;
-use crate::error::{TitanicError, TitanicResult};
-use crate::ZMQ_POLL_MSEC;
+use crate::consts::{
+    DEFAULT_RECONNECT_DELAY_MS, HEARTBEAT_INTERVAL, HEARTBEAT_LIVENESS, MDPW_WORKER,
+    MINIMUM_MESSAGE_FRAMES, ZMQ_POLL_MSEC,
+};
+use crate::majordomo::commands::Command;
+use crate::majordomo::error::{MajordomoError, MajordomoResult};
+use crate::util::{zmq_unwrap, zmq_wrap};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 use zmq::{Context, Socket};
 
-const HEARTBEAT_LIVENESS: usize = 3;
-const MDPW_WORKER: &str = "MDPW01";
-const DEFAULT_HEARTBEAT_DELAY_MS: usize = 2500;
-const DEFAULT_RECONNECT_DELAY_MS: usize = 2500;
-const MINIMUM_MESSAGE_FRAMES: usize = 3;
-
 struct MajordomoWorker {
     context: Context,
     broker: String,
-    broker_socket: Socket,
+    broker_socket: Option<Socket>,
 
     service_name: String,
 
@@ -37,30 +35,32 @@ struct MajordomoWorker {
     /// List of return addresses for the current request.
     /// These addresses are used to route replies back through
     /// the broker to the original client.
-    reply_to: Vec<String>,
+    reply_to: Vec<Vec<u8>>,
 }
 
 impl Drop for MajordomoWorker {
     fn drop(&mut self) {
-        self.broker_socket.disconnect(&self.broker).unwrap();
+        let broker = &self.broker;
+        if let Some(broker_socket) = self.broker_socket.as_ref() {
+            broker_socket.disconnect(broker).unwrap();
+        }
         self.context.destroy().unwrap();
     }
 }
 
 impl MajordomoWorker {
-    fn new(broker: String, service_name: String) -> TitanicResult<Self> {
+    fn new(broker: String, service_name: String) -> MajordomoResult<Self> {
         let context = Context::new();
-        let broker_socket = context.socket(zmq::DEALER)?;
-        let heartbeat_delay = DEFAULT_HEARTBEAT_DELAY_MS;
+        let heartbeat_delay = HEARTBEAT_INTERVAL;
 
         let mut worker = Self {
             context,
             broker,
-            broker_socket,
+            broker_socket: None,
             service_name,
             liveness: HEARTBEAT_LIVENESS,
             heartbeat_at: Instant::now()
-                .checked_add(Duration::from_millis(heartbeat_delay as u64))
+                .checked_add(Duration::from_millis(HEARTBEAT_INTERVAL as u64))
                 .unwrap(),
             heartbeat_delay,
             reconnect_delay: DEFAULT_RECONNECT_DELAY_MS,
@@ -68,37 +68,48 @@ impl MajordomoWorker {
             reply_to: vec![],
         };
 
+        worker.heartbeat_at = Instant::now()
+            .checked_add(Duration::from_millis(HEARTBEAT_INTERVAL as u64))
+            .unwrap();
+
         worker.connect_to_broker()?;
         Ok(worker)
     }
 
-    fn connect_to_broker(&mut self) -> TitanicResult<Socket> {
-        let socket = self
-            .context
-            .socket(zmq::DEALER)
-            .map_err(TitanicError::from)?;
-        socket
+    fn connect_to_broker(&mut self) -> MajordomoResult<()> {
+        self.broker_socket = Some(
+            self.context
+                .socket(zmq::DEALER)
+                .map_err(MajordomoError::from)?,
+        );
+        self.broker_socket
+            .as_ref()
+            .unwrap()
             .connect(self.broker.as_str())
-            .map_err(TitanicError::from)?;
-        self.send_to_broker(Command::Ready, Some(self.service_name.as_str()), None)?;
+            .map_err(MajordomoError::from)?;
         self.liveness = HEARTBEAT_LIVENESS;
         self.heartbeat_at = Instant::now()
             .checked_add(Duration::from_millis(self.heartbeat_delay as u64))
             .unwrap();
-        Ok(socket)
-    }
-
-    fn reconnect(&mut self) -> TitanicResult<()> {
-        self.broker_socket = self.connect_to_broker()?;
+        self.send_to_broker(
+            Command::Ready,
+            None,
+            Some(vec![self.service_name.as_bytes().to_vec()]),
+        )?;
         Ok(())
     }
 
-    fn validate_message(reply: &[Vec<u8>]) -> TitanicResult<()> {
+    fn reconnect(&mut self) -> MajordomoResult<()> {
+        self.connect_to_broker()?;
+        Ok(())
+    }
+
+    fn validate_message(reply: &[Vec<u8>]) -> MajordomoResult<()> {
         if reply.len() < MINIMUM_MESSAGE_FRAMES {
-            return Err(TitanicError::ProtocolError("Invalid message format"));
+            return Err(MajordomoError::ProtocolError("Invalid message format"));
         }
         if reply[0] != b"" || reply[1] != MDPW_WORKER.as_bytes() {
-            return Err(TitanicError::ProtocolError("Invalid protocol header"));
+            return Err(MajordomoError::ProtocolError("Invalid protocol header"));
         }
         Ok(())
     }
@@ -108,7 +119,7 @@ impl MajordomoWorker {
         command: Command,
         option: Option<&str>,
         msg: Option<Vec<Vec<u8>>>,
-    ) -> TitanicResult<()> {
+    ) -> MajordomoResult<()> {
         let command_bytes = vec![command.as_byte()];
 
         // Protocol Order is;
@@ -117,7 +128,7 @@ impl MajordomoWorker {
         //  3. Command
         //  4. Existing Message
         let mut message_parts: Vec<Vec<u8>> = vec![
-            Vec::from("".as_bytes()),
+            Vec::new(),
             Vec::from(MDPW_WORKER.as_bytes()),
             Vec::from(command_bytes.as_slice()),
         ];
@@ -129,37 +140,34 @@ impl MajordomoWorker {
             message_parts.extend(existing_msg.iter().cloned());
         }
         debug!("Sending {} to broker", command);
+        debug!("Sending message parts: {:?}", message_parts);
         self.broker_socket
+            .as_ref()
+            .unwrap()
             .send_multipart(message_parts.as_slice(), 0)?;
+        debug!("Sent multipart message");
         Ok(())
     }
 
-    fn handle_request(&mut self, reply: &[Vec<u8>]) -> TitanicResult<Option<Vec<Vec<u8>>>> {
-        let mut reply_idx = 3;
-        let mut addresses = Vec::with_capacity(1);
-
-        while !reply[reply_idx].is_empty() {
-            addresses.push(String::from_utf8_lossy(&reply[reply_idx]).to_string());
-            reply_idx += 1;
-        }
-
-        self.reply_to = addresses;
-        // Skip empty delimiter frame.
-        Ok(Some(reply[reply_idx + 1..].to_vec()))
-    }
-
-    fn handle_message(&mut self) -> TitanicResult<Option<Vec<Vec<u8>>>> {
-        let reply = self
+    fn handle_message(&mut self) -> MajordomoResult<Option<Vec<Vec<u8>>>> {
+        let mut reply = self
             .broker_socket
+            .as_ref()
+            .unwrap()
             .recv_multipart(0)
-            .map_err(TitanicError::from)?;
-        debug!("Received message from broker");
+            .map_err(MajordomoError::from)?;
         self.liveness = HEARTBEAT_LIVENESS;
         MajordomoWorker::validate_message(&reply)?;
-        let command = Command::from_byte(reply[2][0]).unwrap();
+        // Remove empty frame.
+        reply.remove(0);
+        let _header_frame = reply.remove(0);
+        let command = Command::from_byte(reply.remove(0)[0]).unwrap();
+        debug!("Received {command} message from broker");
         match command {
             Command::Request => {
-                self.handle_request(&reply[1..].to_vec())
+                let (routing_addresses, message) = zmq_unwrap(reply);
+                self.reply_to = routing_addresses;
+                Ok(Some(message))
             }
             Command::Heartbeat => {
                 // Do nothing for heartbeats.
@@ -176,61 +184,57 @@ impl MajordomoWorker {
     /// .split recv method
     /// This first sends any reply, and then waits for a new request.
     /// Send reply, if any, to broker, and wait for next request.
-    fn receive(&mut self, reply: Option<Vec<Vec<u8>>>) -> TitanicResult<Option<Vec<Vec<u8>>>> {
+    fn receive(&mut self, reply: Option<Vec<Vec<u8>>>) -> MajordomoResult<Option<Vec<Vec<u8>>>> {
         if let Some(reply) = reply {
             if self.reply_to.is_empty() {
-                return Err(TitanicError::ConfigurationError("No reply address set"));
+                return Err(MajordomoError::ConfigurationError("No reply address set"));
             } else {
-                // Push reply_to into message body
-                let mut reply = reply.to_vec();
-                // Push empty frame to delimit.
-                reply.insert(0, b"".to_vec());
-                for address in self.reply_to.iter() {
-                    reply.insert(0, Vec::from(address.as_bytes()));
-                }
+                let reply = zmq_wrap(self.reply_to.clone(), reply.to_vec());
                 self.send_to_broker(Command::Reply, None, Some(reply))?;
             }
-            self.expect_reply = true;
-            loop {
-                match self
-                    .broker_socket
-                    .poll(zmq::POLLIN, (self.heartbeat_delay * ZMQ_POLL_MSEC) as i64)
-                    .map_err(TitanicError::from)?
-                {
-                    // Handle Incoming Message
-                    1 => {
-                        if let Some(reply) = self.handle_message()? {
-                            return Ok(Some(reply));
-                        }
+        }
+        self.expect_reply = true;
+        loop {
+            match self
+                .broker_socket
+                .as_ref()
+                .unwrap()
+                .poll(zmq::POLLIN, (self.heartbeat_delay * ZMQ_POLL_MSEC) as i64)
+                .map_err(MajordomoError::from)?
+            {
+                // Handle Incoming Message
+                1 => {
+                    if let Some(reply) = self.handle_message()? {
+                        return Ok(Some(reply));
                     }
-                    // Interruption
-                    -1 => break,
-                    // Timeout, handle Reconnection
-                    0 => {
-                        self.liveness -= 1;
+                }
+                // Interruption
+                -1 => break,
+                // Timeout, handle Reconnection
+                0 => {
+                    self.liveness -= 1;
+                    if self.liveness == 0 {
                         warn!("Disconnected from broker - retrying");
                         sleep(Duration::from_millis(self.reconnect_delay as u64));
                         self.reconnect()?;
-                    },
-                    _ => unreachable!("zmq_poll only returns -1, 0, or positive values")
+                    }
                 }
-                if Instant::now() > self.heartbeat_at {
-                    self.send_to_broker(Command::Heartbeat, None, None)?;
-                    self.heartbeat_at = Instant::now()
-                        .checked_add(Duration::from_millis(self.heartbeat_delay as u64))
-                        .unwrap();
-                }
-                if crate::is_interrupted() {
-                    return Err(TitanicError::Interrupted);
-                }
+                _ => unreachable!("zmq_poll only returns -1, 0, or positive values"),
+            }
+            if Instant::now() > self.heartbeat_at {
+                self.send_to_broker(Command::Heartbeat, None, None)?;
+                self.heartbeat_at =
+                    Instant::now() + Duration::from_millis(self.heartbeat_delay as u64);
+            }
+            if crate::is_interrupted() {
+                return Err(MajordomoError::Interrupted);
             }
         }
         Ok(None)
     }
 }
 
-
-fn example_worker() -> TitanicResult<()> {
+pub(crate) fn example_worker() -> MajordomoResult<()> {
     let mut worker = MajordomoWorker::new("tcp://localhost:5555".to_string(), "echo".to_string())?;
     let mut stored_reply: Option<Vec<Vec<u8>>> = None;
     loop {

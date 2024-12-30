@@ -1,5 +1,7 @@
-use crate::error::{TitanicError, TitanicResult};
-use crate::{MDP_CLIENT, ZMQ_POLL_MSEC};
+use crate::consts::{MDP_CLIENT, ZMQ_POLL_MSEC};
+use crate::majordomo::error::{MajordomoError, MajordomoResult};
+use crate::util::zmq_unwrap;
+use log::warn;
 use tracing::debug;
 use zmq::{Context, Socket};
 
@@ -20,7 +22,7 @@ impl Drop for MajordomoClient {
 }
 
 impl MajordomoClient {
-    pub fn new(broker: String) -> TitanicResult<Self> {
+    pub fn new(broker: String) -> MajordomoResult<Self> {
         let context = Context::new();
         let broker_socket = MajordomoClient::connect_to_broker(&context, broker.as_str())?;
         debug!("Connected to broker");
@@ -34,66 +36,75 @@ impl MajordomoClient {
         })
     }
 
-    fn connect_to_broker(context: &Context, broker: &str) -> TitanicResult<Socket> {
-        let socket = context.socket(zmq::REQ).map_err(TitanicError::from)?;
-        socket.connect(broker).map_err(TitanicError::from)?;
+    fn connect_to_broker(context: &Context, broker: &str) -> MajordomoResult<Socket> {
+        let socket = context.socket(zmq::REQ).map_err(MajordomoError::from)?;
+        socket.connect(broker).map_err(MajordomoError::from)?;
         Ok(socket)
     }
 
-    fn validate_reply(reply: &[Vec<u8>], service: &str) -> TitanicResult<()> {
+    fn validate_reply(reply: &[Vec<u8>], service: &str) -> MajordomoResult<()> {
         if reply.len() < 3 {
-            return Err(TitanicError::InvalidReply("Too few frames"));
+            return Err(MajordomoError::InvalidReply("Too few frames"));
         }
         if reply[0] != MDP_CLIENT.as_bytes() {
-            return Err(TitanicError::InvalidReply(
-                "Invalid protocol header",
-            ));
+            return Err(MajordomoError::InvalidReply("Invalid protocol header"));
         }
-        if reply[1] != service.as_bytes() {
-            return Err(TitanicError::InvalidReply("Service mismatch"));
+        if String::from_utf8(reply[1].to_vec()).unwrap() != service {
+            return Err(MajordomoError::InvalidReply("Service mismatch"));
         }
         Ok(())
     }
 
     /// Send a request to the broker and gets a reply - even if it has to retry multiple times.
-    pub fn send(
-        &mut self,
-        service: &str,
-        messages: Vec<Vec<u8>>,
-    ) -> TitanicResult<Vec<Vec<u8>>> {
+    pub fn send(&mut self, service: &str, messages: Vec<Vec<u8>>) -> MajordomoResult<Vec<Vec<u8>>> {
         // Frames
         // Frame 1: "MPDCxy" MDP/Client x.y
         // Frame 2: Service name (Printable String)
         // Frame 3+: Request Body
-        let mut message_parts: Vec<Vec<u8>> = vec![Vec::from(MDP_CLIENT.as_bytes()), Vec::from(service.as_bytes())];
+        let mut message_parts: Vec<Vec<u8>> = vec![
+            Vec::from(MDP_CLIENT.as_bytes()),
+            Vec::from(service.as_bytes()),
+        ];
         message_parts.extend(messages.iter().cloned());
-        debug!("Sending message to {} service", service);
+        debug!("Sending message {:?} to {} service", message_parts, service);
         let mut retries_left: usize = self.retries;
         while retries_left > 0 && !crate::is_interrupted() {
             self.broker_socket
                 .send_multipart(message_parts.clone(), 0)
-                .map_err(TitanicError::from)?;
+                .map_err(MajordomoError::from)?;
 
             match self
                 .broker_socket
                 .poll(zmq::POLLIN, (self.timeout * ZMQ_POLL_MSEC) as i64)
-                .map_err(TitanicError::from)?
+                .map_err(MajordomoError::from)?
             {
                 1 => {
                     // Some event was signalled
                     let reply = self
                         .broker_socket
                         .recv_multipart(0)
-                        .map_err(TitanicError::from)?;
-                    debug!("Received reply");
-                    MajordomoClient::validate_reply(&reply, &self.broker)?;
-                    return Ok(reply[2..].to_vec());
+                        .map_err(MajordomoError::from)?;
+                    let (_routing_envelope, core_message) = zmq_unwrap(reply);
+                    debug!(
+                        "Received reply. Envelope: {:?}, Message: {:?}",
+                        _routing_envelope, core_message
+                    );
+                    MajordomoClient::validate_reply(&core_message, service)?;
+                    return Ok(core_message);
                 }
                 0 => {
                     retries_left -= 1;
-                    dbg!("No reply, reconnecting");
-                    self.broker_socket =
-                        MajordomoClient::connect_to_broker(&self.context, self.broker.as_str())?;
+                    if retries_left > 0 {
+                        warn!("No reply, reconnecting");
+                        self.broker_socket = MajordomoClient::connect_to_broker(
+                            &self.context,
+                            self.broker.as_str(),
+                        )?;
+                        self.retries = 3;
+                    } else {
+                        // No more retries, give up;
+                        return Err(MajordomoError::Generic("No more retries".to_string()));
+                    }
                 }
                 // Disallowed by API
                 _ => unreachable!(),
@@ -101,21 +112,14 @@ impl MajordomoClient {
         }
 
         if crate::is_interrupted() {
-            return Err(TitanicError::Interrupted);
+            return Err(MajordomoError::Interrupted);
         }
-        Err(TitanicError::NoResponseFromBroker(self.retries))
-    }
-
-    pub fn set_timeout(&mut self, timeout: usize) {
-        self.timeout = timeout;
-    }
-
-    pub fn set_retries(&mut self, retries: usize) {
-        self.retries = retries;
+        Err(MajordomoError::NoResponseFromBroker(self.retries))
     }
 }
 
-fn example_app() -> TitanicResult<()> {
+pub(crate) fn example_client() -> MajordomoResult<()> {
+    let start_time = std::time::Instant::now();
     let mut majordomo_client = MajordomoClient::new("tcp://localhost:5555".to_string())?;
     let mut count: usize = 0;
     while count < 100_000 {
@@ -126,6 +130,11 @@ fn example_app() -> TitanicResult<()> {
         }
         count += 1;
     }
+    let duration = start_time.elapsed();
+    let requests_per_second = count as f64 / duration.as_secs_f64();
+
     println!("{} requests/replies processed", count);
+    println!("Total time: {:.2?}", duration);
+    println!("Requests per second: {:.2}", requests_per_second);
     Ok(())
 }

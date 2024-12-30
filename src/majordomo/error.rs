@@ -1,9 +1,9 @@
 use thiserror::Error;
 
-pub type TitanicResult<T> = Result<T, TitanicError>;
+pub type MajordomoResult<T> = Result<T, MajordomoError>;
 
 #[derive(Error, Debug, Clone, PartialEq)]
-pub enum TitanicError {
+pub enum MajordomoError {
     #[error("Generic: {0}")]
     Generic(String),
 
@@ -24,17 +24,17 @@ pub enum TitanicError {
 }
 
 macro_rules! error_from {
-    ($err:ty, $titanic_error:ident, $func:expr) => {
-        impl From<$err> for TitanicError {
+    ($err:ty, $majordomo_error:ident, $func:expr) => {
+        impl From<$err> for MajordomoError {
             fn from(value: $err) -> Self {
-                TitanicError::$titanic_error($func(value))
+                MajordomoError::$majordomo_error($func(value))
             }
         }
     };
-    ($err:ty, $titanic_error:ident) => {
-        impl From<$err> for TitanicError {
+    ($err:ty, $majordomo_error:ident) => {
+        impl From<$err> for MajordomoError {
             fn from(value: $err) -> Self {
-                TitanicError::$titanic_error(value.to_string())
+                MajordomoError::$majordomo_error(value.to_string())
             }
         }
     };
