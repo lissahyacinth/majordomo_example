@@ -4,7 +4,7 @@ pub mod majordomo;
 pub(crate) mod util;
 
 use crate::majordomo::broker::example_broker;
-use crate::majordomo::client::example_client;
+use crate::majordomo::client::{example_async_client, example_client};
 use crate::majordomo::worker::example_worker;
 use lazy_static::lazy_static;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,15 +33,16 @@ fn main() {
     init_interrupt_handler();
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 2 {
-        eprintln!("Usage: {} [worker|broker|client]", args[0]);
+        eprintln!("Usage: {} [worker|broker|aclient|client]", args[0]);
         std::process::exit(1);
     }
     let result = match args[1].as_str() {
         "worker" => example_worker(),
         "broker" => example_broker(),
+        "aclient" => example_async_client(),
         "client" => example_client(),
         _ => {
-            eprintln!("Invalid argument. Use: worker, broker, or client");
+            eprintln!("Invalid argument. Use: worker, broker, aclient, or client");
             std::process::exit(1);
         }
     };

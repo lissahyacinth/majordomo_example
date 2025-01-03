@@ -8,11 +8,10 @@ pub(crate) fn from_hex_string(hex: &str) -> Result<Vec<u8>, FromHexError> {
     hex::decode(hex)
 }
 
-
 /// Unwrap a message by removing all routing frames
 /// Returns (Routing Frames, Remaining Message)
 pub fn zmq_unwrap(mut message: Vec<Vec<u8>>) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
-    for i in 0.. message.len() {
+    for i in 0..message.len() {
         if message[i].is_empty() {
             let remaining = message.split_off(i + 1);
             return (message, remaining);

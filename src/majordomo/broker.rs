@@ -5,7 +5,7 @@ use crate::majordomo::error::{MajordomoError, MajordomoResult};
 use crate::util::{from_hex_string, to_hex_string, zmq_unwrap, zmq_wrap};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use zmq::{Context, Socket};
 
 struct MajordomoBroker {
@@ -127,6 +127,7 @@ impl MajordomoBroker {
             expired_workers.extend(service.purge()?);
         }
         for worker in expired_workers {
+            warn!("Removing worker {}", &worker.identity);
             self.workers_to_service.remove(&worker.identity);
         }
         Ok(())
@@ -191,7 +192,6 @@ impl MajordomoBroker {
             .ok_or(MajordomoError::Generic(
                 "Could not find service".to_string(),
             ))?;
-        // When there's a request and an available worker for this service.
         while !service.waiting.is_empty() && !service.requests.is_empty() {
             // Get available worker.
             let worker = service.waiting.pop().unwrap();
@@ -248,15 +248,21 @@ impl MajordomoBroker {
         &mut self,
         worker_identity: &str,
         service_name: &str,
-        new_worker: bool
+        new_worker: bool,
     ) -> MajordomoResult<()> {
-        let relevant_service = self.services.get_mut(service_name).ok_or(MajordomoError::Generic("Service not found".to_owned()))?;
-        relevant_service.waiting.push(Worker::new(worker_identity.to_string()));
+        let relevant_service = self
+            .services
+            .get_mut(service_name)
+            .ok_or(MajordomoError::Generic("Service not found".to_owned()))?;
+        relevant_service
+            .waiting
+            .push(Worker::new(worker_identity.to_string()));
         if new_worker {
             relevant_service.workers += 1;
         }
         self.workers_to_service
             .insert(worker_identity.to_string(), service_name.to_string());
+        self.service_dispatch(service_name, None)?;
         Ok(())
     }
 
